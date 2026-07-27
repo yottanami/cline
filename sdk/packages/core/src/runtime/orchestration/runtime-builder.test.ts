@@ -486,7 +486,8 @@ process.stdin.on("data", (chunk) => {
 			serverPath,
 			`let buffer = "";
 function write(payload) {
-  process.stdout.write(JSON.stringify(payload) + "\\n");
+  const body = JSON.stringify(payload);
+  process.stdout.write("Content-Length: " + Buffer.byteLength(body, "utf8") + "\\r\\n\\r\\n" + body);
 }
 function handle(message) {
   if (message.method === "initialize") {
@@ -503,12 +504,19 @@ function handle(message) {
 }
 process.stdin.on("data", (chunk) => {
   buffer += chunk.toString("utf8");
-  let newline;
-  while ((newline = buffer.indexOf("\\n")) >= 0) {
-    const line = buffer.slice(0, newline).trim();
-    buffer = buffer.slice(newline + 1);
-    if (!line) continue;
-    const message = JSON.parse(line);
+  while (true) {
+    const separator = buffer.indexOf("\\r\\n\\r\\n");
+    if (separator < 0) break;
+    const header = buffer.slice(0, separator);
+    const match = header.match(/Content-Length:\\s*(\\d+)/i);
+    if (!match) throw new Error("missing content length");
+    const length = Number(match[1]);
+    const start = separator + 4;
+    const end = start + length;
+    if (buffer.length < end) break;
+    const body = buffer.slice(start, end);
+    buffer = buffer.slice(end);
+    const message = JSON.parse(body);
     if (message.method === "notifications/initialized") continue;
     handle(message);
   }
@@ -557,7 +565,7 @@ process.stdin.on("data", (chunk) => {
 		writeFileSync(
 			serverPath,
 			`process.stdin.once("data", () => {
-  process.stdout.write("{]\\n");
+  process.stdout.write("Content-Length: 2\\r\\n\\r\\n{]");
 });`,
 			"utf8",
 		);
