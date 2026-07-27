@@ -760,11 +760,19 @@ export class McpHub {
 				Logger.error(`[MCP Debug] Error setting notification handlers for ${name}:`, error)
 			}
 
-			// Initial fetch of tools, resources, and prompts
-			connection.server.tools = await this.fetchToolsList(name)
-			connection.server.resources = await this.fetchResourcesList(name)
-			connection.server.resourceTemplates = await this.fetchResourceTemplatesList(name)
-			connection.server.prompts = await this.fetchPromptsList(name)
+			// Initial fetch of tools, resources, and prompts. Run in parallel so a
+			// hung server blocks connect for at most one per-server timeout rather
+			// than four in series.
+			const [tools, resources, resourceTemplates, prompts] = await Promise.all([
+				this.fetchToolsList(name),
+				this.fetchResourcesList(name),
+				this.fetchResourceTemplatesList(name),
+				this.fetchPromptsList(name),
+			])
+			connection.server.tools = tools
+			connection.server.resources = resources
+			connection.server.resourceTemplates = resourceTemplates
+			connection.server.prompts = prompts
 		} catch (error) {
 			// Update status with error
 			const connection = this.findConnection(name, source)
