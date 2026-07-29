@@ -9,11 +9,13 @@ import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotoc
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import {
 	CallToolResultSchema,
+	ErrorCode,
 	GetPromptResultSchema,
 	ListPromptsResultSchema,
 	ListResourcesResultSchema,
 	ListResourceTemplatesResultSchema,
 	ListToolsResultSchema,
+	McpError,
 	PromptListChangedNotificationSchema,
 	ReadResourceResultSchema,
 	ResourceListChangedNotificationSchema,
@@ -53,8 +55,11 @@ import { BaseConfigSchema, McpSettingsSchema, ServerConfigSchema } from "./schem
 import type { McpConnection, McpServerConfig, Transport } from "./types"
 
 // Debounce window that coalesces a burst of list_changed notifications into
-// one refresh, and the bounded backoff used when that refresh's fetch fails.
+// one refresh, the cap on how long a sustained stream of notifications can
+// keep deferring that refresh, and the bounded backoff used when the
+// refresh's fetch fails.
 const LIST_CHANGED_DEBOUNCE_MS = 300
+const LIST_CHANGED_MAX_WAIT_MS = 2000
 const LIST_CHANGED_MAX_RETRIES = 3
 const LIST_CHANGED_RETRY_BASE_DELAY_MS = 1000
 
@@ -134,6 +139,10 @@ export class McpHub {
 	// publish has been superseded by a newer notification — it drops its
 	// result instead of briefly publishing an obsolete list.
 	private listChangedRefreshGeneration: Map<string, number> = new Map()
+	// Deadline per key that caps how long re-debouncing can defer a refresh:
+	// without it, a sustained stream of notifications arriving faster than
+	// the debounce window would starve the refresh indefinitely.
+	private listChangedRefreshDeadlines: Map<string, number> = new Map()
 
 	constructor(
 		getMcpServersPath: () => Promise<string>,
@@ -513,7 +522,11 @@ export class McpHub {
 							McpHub.mcpServerKeys.delete(connection.server.uid || name)
 							this.appendErrorMessage(connection, error instanceof Error ? error.message : `${error}`)
 						}
-						await this.notifyWebviewOfServerChanges()
+						// onerror's promise is discarded, so a rejection here
+						// would surface as an unhandled rejection
+						await this.notifyWebviewOfServerChanges().catch((notifyError) => {
+							Logger.error(`Failed to publish server state for "${name}":`, notifyError)
+						})
 					}
 
 					transport.onclose = async () => {
@@ -595,7 +608,11 @@ export class McpHub {
 							McpHub.mcpServerKeys.delete(connection.server.uid || name)
 							this.appendErrorMessage(connection, error instanceof Error ? error.message : `${error}`)
 						}
-						await this.notifyWebviewOfServerChanges()
+						// onerror's promise is discarded, so a rejection here
+						// would surface as an unhandled rejection
+						await this.notifyWebviewOfServerChanges().catch((notifyError) => {
+							Logger.error(`Failed to publish server state for "${name}":`, notifyError)
+						})
 					}
 					break
 				}
@@ -797,6 +814,25 @@ export class McpHub {
 	}
 
 	/**
+	 * A server that never declared a capability has an authoritatively empty
+	 * list for it — not a transient failure worth retrying. Undefined
+	 * capabilities (not yet negotiated) are treated as supported.
+	 */
+	private static serverSupports(connection: McpConnection, capability: "tools" | "resources" | "prompts"): boolean {
+		const capabilities = connection.client?.getServerCapabilities()
+		return capabilities === undefined || capabilities[capability] !== undefined
+	}
+
+	/**
+	 * Like serverSupports, for servers that declare a capability but answer a
+	 * specific list request with "method not found" (common for
+	 * resources/templates/list): also an authoritatively empty list.
+	 */
+	private static isMethodNotFound(error: unknown): boolean {
+		return error instanceof McpError && error.code === ErrorCode.MethodNotFound
+	}
+
+	/**
 	 * Fetches the server's tool list. Returns undefined when the fetch fails,
 	 * so callers can distinguish an error from a genuinely empty list.
 	 */
@@ -810,6 +846,10 @@ export class McpHub {
 
 			// Disabled servers don't have clients, so return empty tools list
 			if (connection.server.disabled || !connection.client) {
+				return []
+			}
+
+			if (!McpHub.serverSupports(connection, "tools")) {
 				return []
 			}
 
@@ -831,6 +871,9 @@ export class McpHub {
 
 			return tools
 		} catch (error) {
+			if (McpHub.isMethodNotFound(error)) {
+				return []
+			}
 			Logger.error(`Failed to fetch tools for ${serverName}:`, error)
 			return undefined
 		}
@@ -846,11 +889,18 @@ export class McpHub {
 				return []
 			}
 
+			if (!McpHub.serverSupports(connection, "resources")) {
+				return []
+			}
+
 			const response = await connection.client.request({ method: "resources/list" }, ListResourcesResultSchema, {
 				timeout: DEFAULT_REQUEST_TIMEOUT_MS,
 			})
 			return response?.resources || []
-		} catch (_error) {
+		} catch (error) {
+			if (McpHub.isMethodNotFound(error)) {
+				return []
+			}
 			// Logger.error(`Failed to fetch resources for ${serverName}:`, error)
 			return undefined
 		}
@@ -866,6 +916,10 @@ export class McpHub {
 				return []
 			}
 
+			if (!McpHub.serverSupports(connection, "resources")) {
+				return []
+			}
+
 			const response = await connection.client.request(
 				{ method: "resources/templates/list" },
 				ListResourceTemplatesResultSchema,
@@ -875,7 +929,10 @@ export class McpHub {
 			)
 
 			return response?.resourceTemplates || []
-		} catch (_error) {
+		} catch (error) {
+			if (McpHub.isMethodNotFound(error)) {
+				return []
+			}
 			// Logger.error(`Failed to fetch resource templates for ${serverName}:`, error)
 			return undefined
 		}
@@ -888,6 +945,10 @@ export class McpHub {
 
 			// Disabled servers don't have clients, so return empty prompts list
 			if (!connection || connection.server.disabled || !connection.client) {
+				return []
+			}
+
+			if (!McpHub.serverSupports(connection, "prompts")) {
 				return []
 			}
 
@@ -905,7 +966,10 @@ export class McpHub {
 					required: arg.required,
 				})),
 			}))
-		} catch (_error) {
+		} catch (error) {
+			if (McpHub.isMethodNotFound(error)) {
+				return []
+			}
 			return undefined
 		}
 	}
@@ -935,11 +999,23 @@ export class McpHub {
 		const generation = (this.listChangedRefreshGeneration.get(key) ?? 0) + 1
 		this.listChangedRefreshGeneration.set(key, generation)
 		const superseded = () => this.listChangedRefreshGeneration.get(key) !== generation
-		const delayMs = retryAttempt === 0 ? LIST_CHANGED_DEBOUNCE_MS : LIST_CHANGED_RETRY_BASE_DELAY_MS * 2 ** (retryAttempt - 1)
+		let delayMs: number
+		if (retryAttempt === 0) {
+			// Debounce, but cap the total deferral: a sustained stream of
+			// notifications re-arming the timer would otherwise starve the
+			// refresh indefinitely.
+			const now = Date.now()
+			const deadline = this.listChangedRefreshDeadlines.get(key) ?? now + LIST_CHANGED_MAX_WAIT_MS
+			this.listChangedRefreshDeadlines.set(key, deadline)
+			delayMs = Math.max(0, Math.min(LIST_CHANGED_DEBOUNCE_MS, deadline - now))
+		} else {
+			delayMs = LIST_CHANGED_RETRY_BASE_DELAY_MS * 2 ** (retryAttempt - 1)
+		}
 		this.listChangedRefreshTimers.set(
 			key,
 			setTimeout(() => {
 				this.listChangedRefreshTimers.delete(key)
+				this.listChangedRefreshDeadlines.delete(key)
 				// Chain onto any refresh still in flight for this key: two
 				// concurrent refreshes could otherwise complete out of order
 				// and let a stale response overwrite a newer list.
@@ -985,6 +1061,15 @@ export class McpHub {
 			return "skipped"
 		}
 
+		// This run is stale once the connection was deleted/replaced (a
+		// replacement fetched fresh lists at connect time, after the change
+		// that produced this notification) or a newer notification superseded
+		// it (that refresh will fetch fresher data). A stale run must neither
+		// publish its (older) result nor retry — hence "skipped", including
+		// for fetch failures, which staleness explains (e.g. the transport
+		// was torn down mid-flight by a reconnect).
+		const stale = () => superseded() || this.connections.find((conn) => conn.server.name === serverName) !== connection
+
 		// A failed fetch returns undefined; keep the previous cached list in
 		// that case rather than publishing an empty one, and skip the webview
 		// notification entirely when nothing was refreshed.
@@ -997,14 +1082,14 @@ export class McpHub {
 			case "tools":
 				tools = await this.fetchToolsList(serverName)
 				if (tools === undefined) {
-					return "failed"
+					return stale() ? "skipped" : "failed"
 				}
 				break
 			case "resources":
 				resources = await this.fetchResourcesList(serverName)
 				resourceTemplates = await this.fetchResourceTemplatesList(serverName)
 				if (resources === undefined && resourceTemplates === undefined) {
-					return "failed"
+					return stale() ? "skipped" : "failed"
 				}
 				// Half of the pair failed: publish the successful half now and
 				// still retry so the other half doesn't stay stale.
@@ -1013,42 +1098,56 @@ export class McpHub {
 			case "prompts":
 				prompts = await this.fetchPromptsList(serverName)
 				if (prompts === undefined) {
-					return "failed"
+					return stale() ? "skipped" : "failed"
 				}
 				break
 		}
 
-		// The connection may have been deleted or replaced by a reconnect, or
-		// this refresh superseded by a newer notification, while the fetches
-		// were in flight. Drop the result in either case: a replacement
-		// connection fetched fresh lists when it connected, and a superseding
-		// refresh will fetch fresher data — publishing this (older) result
-		// would briefly expose an obsolete list.
-		const current = this.connections.find((conn) => conn.server.name === serverName)
-		if (current !== connection || superseded()) {
+		if (stale()) {
 			return "skipped"
 		}
 
 		if (tools !== undefined) {
-			current.server.tools = tools
+			connection.server.tools = tools
 		}
 		if (resources !== undefined) {
-			current.server.resources = resources
+			connection.server.resources = resources
 		}
 		if (resourceTemplates !== undefined) {
-			current.server.resourceTemplates = resourceTemplates
+			connection.server.resourceTemplates = resourceTemplates
 		}
 		if (prompts !== undefined) {
-			current.server.prompts = prompts
+			connection.server.prompts = prompts
 		}
 
 		// Push the refreshed lists to the webview; for tools this also runs
-		// the tool-list change check that notifies the SDK controller.
-		await this.notifyWebviewOfServerChanges()
+		// the tool-list change check that notifies the SDK controller. A
+		// publish failure counts as "failed" so the caller retries: the cache
+		// is updated but consumers haven't seen it yet.
+		try {
+			await this.notifyWebviewOfServerChanges()
+		} catch (error) {
+			Logger.error(`[MCP] Failed to publish refreshed ${kind} for ${serverName}:`, error)
+			return "failed"
+		}
 		return fetchFailed ? "failed" : "refreshed"
 	}
 
 	async deleteConnection(name: string): Promise<void> {
+		// Cancel pending list_changed refresh timers for this server: either
+		// it's going away, or a replacement connection will fetch fresh lists
+		// itself. Generation entries are kept — they must stay monotonic so
+		// an in-flight refresh from the old connection can't mistake a
+		// post-reconnect generation for its own.
+		for (const kind of ["tools", "resources", "prompts"]) {
+			const key = `${name}:${kind}`
+			const timer = this.listChangedRefreshTimers.get(key)
+			if (timer) {
+				clearTimeout(timer)
+				this.listChangedRefreshTimers.delete(key)
+			}
+			this.listChangedRefreshDeadlines.delete(key)
+		}
 		const connection = this.connections.find((conn) => conn.server.name === name)
 		if (connection) {
 			try {
@@ -2077,6 +2176,11 @@ export class McpHub {
 		}
 		this.listChangedRefreshTimers.clear()
 		this.listChangedRefreshGeneration.clear()
+		this.listChangedRefreshDeadlines.clear()
+		if (this.toolListChangeDebounceTimer) {
+			clearTimeout(this.toolListChangeDebounceTimer)
+			this.toolListChangeDebounceTimer = undefined
+		}
 		this.removeAllFileWatchers()
 		for (const connection of this.connections) {
 			try {
